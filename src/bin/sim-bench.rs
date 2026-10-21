@@ -54,6 +54,7 @@
 
 mod sim_bench_match;
 
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -354,6 +355,9 @@ enum Plan {
 }
 
 fn percentile(sorted: &[Duration], fraction: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
     sorted[index].as_secs_f64() * 1000.0
 }
@@ -439,20 +443,48 @@ fn main() -> Result<(), String> {
         println!("progress tick=0 {}", script.progress(runtime));
     }
 
+    run_benchmark(
+        runtime,
+        &mut plan,
+        &args,
+        ticks,
+        warmup,
+        &mut std::io::stdout().lock(),
+        |runtime, commands| {
+            runtime
+                .advance_frame_for_tooling(commands, SIM_TICK_MS)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// Run and report the measured frames; scenario loading remains with main.
+fn run_benchmark(
+    runtime: &mut SimRuntime,
+    plan: &mut Plan,
+    args: &Args,
+    ticks: u64,
+    warmup: u64,
+    output: &mut impl Write,
+    mut advance_frame: impl FnMut(&mut SimRuntime, &[CommandEnvelope]) -> Result<(), String>,
+) -> Result<(), String> {
+    let live_at_start = runtime.simulation.entities().len();
     let mut times = Vec::with_capacity(ticks as usize);
     let mut cpu_times = Vec::with_capacity(ticks as usize);
     let mut hashes = Vec::new();
     let mut hash_times = Vec::new();
+    let mut frame_error = None;
     for tick in 0..ticks {
-        let batch = match &mut plan {
+        let batch = match &mut *plan {
             Plan::March(orders) => orders.get(tick as usize).cloned().unwrap_or_default(),
             Plan::Match(script) => script.orders(runtime, tick),
         };
         let cpu_started = thread_cpu_time();
         let started = Instant::now();
-        runtime
-            .advance_frame_for_tooling(&batch, SIM_TICK_MS)
-            .map_err(|error| format!("tick {tick}: {error}"))?;
+        if let Err(error) = advance_frame(runtime, &batch) {
+            frame_error = Some(format!("tick {tick}: {error}"));
+            break;
+        }
         times.push(started.elapsed());
         cpu_times.push(
             cpu_started
@@ -470,18 +502,24 @@ fn main() -> Result<(), String> {
         {
             let recent = &times[times.len().saturating_sub(PROGRESS_EVERY as usize)..];
             let mean: Duration = recent.iter().sum::<Duration>() / recent.len() as u32;
-            println!(
+            writeln!(
+                output,
                 "progress tick={} mean_ms={:.1} {}",
                 tick + 1,
                 mean.as_secs_f64() * 1000.0,
                 script.progress(runtime)
-            );
+            )
+            .map_err(|error| format!("benchmark output: {error}"))?;
         }
     }
-    let final_hash = runtime.simulation.state_hash();
+    // A refused frame may have partially changed state; only completed runs
+    // have a final hash. Periodic hashes still describe completed frames.
+    let final_hash = frame_error
+        .is_none()
+        .then(|| runtime.simulation.state_hash());
     let live_at_end = runtime.simulation.entities().len();
 
-    if let Some(path) = &args.csv {
+    let csv_error = if let Some(path) = &args.csv {
         let mut text = String::from("tick,ms,cpu_ms\n");
         for (tick, (time, cpu)) in times.iter().zip(&cpu_times).enumerate() {
             text.push_str(&format!(
@@ -494,13 +532,18 @@ fn main() -> Result<(), String> {
                 ))
             ));
         }
-        std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()))?;
-    }
+        std::fs::write(path, text)
+            .err()
+            .map(|error| format!("{}: {error}", path.display()))
+    } else {
+        None
+    };
     let total: Duration = times.iter().sum();
     let steady: Vec<Duration> = times.iter().skip(warmup as usize).copied().collect();
     let mut sorted = times.clone();
     sorted.sort_unstable();
-    println!(
+    writeln!(
+        output,
         "ticks={} total_s={:.2} mean_ms={:.2} p50_ms={:.2} p95_ms={:.2} max_ms={:.2}",
         times.len(),
         total.as_secs_f64(),
@@ -508,43 +551,62 @@ fn main() -> Result<(), String> {
         percentile(&sorted, 0.5),
         percentile(&sorted, 0.95),
         percentile(&sorted, 1.0),
-    );
+    )
+    .map_err(|error| format!("benchmark output: {error}"))?;
     let mut cpu_sorted: Vec<Duration> = cpu_times.iter().flatten().copied().collect();
     if cpu_sorted.len() == times.len() && !cpu_sorted.is_empty() {
         let cpu_total: Duration = cpu_sorted.iter().sum();
         cpu_sorted.sort_unstable();
-        println!(
+        writeln!(
+            output,
             "main_thread_cpu_mean_ms={:.2} p50_ms={:.2} p95_ms={:.2} max_ms={:.2}",
             cpu_total.as_secs_f64() * 1000.0 / cpu_sorted.len() as f64,
             percentile(&cpu_sorted, 0.5),
             percentile(&cpu_sorted, 0.95),
             percentile(&cpu_sorted, 1.0),
-        );
+        )
+        .map_err(|error| format!("benchmark output: {error}"))?;
     }
     if !steady.is_empty() {
         let steady_total: Duration = steady.iter().sum();
-        println!(
+        writeln!(
+            output,
             "after_orders_mean_ms={:.2} (ticks {}..={})",
             steady_total.as_secs_f64() * 1000.0 / steady.len() as f64,
             warmup + 1,
             times.len()
-        );
+        )
+        .map_err(|error| format!("benchmark output: {error}"))?;
     }
     for (tick, hash) in &hashes {
-        println!("hash tick={tick} {hash:016x}");
+        writeln!(output, "hash tick={tick} {hash:016x}")
+            .map_err(|error| format!("benchmark output: {error}"))?;
     }
     if !hash_times.is_empty() {
         let total: Duration = hash_times.iter().sum();
         hash_times.sort_unstable();
-        println!(
+        writeln!(
+            output,
             "periodic_hash_mean_ms={:.3} p50_ms={:.3}",
             total.as_secs_f64() * 1000.0 / hash_times.len() as f64,
             percentile(&hash_times, 0.5)
-        );
+        )
+        .map_err(|error| format!("benchmark output: {error}"))?;
     }
-    println!("live_objects start={live_at_start} end={live_at_end}");
-    println!("final_hash={final_hash:016x}");
-    Ok(())
+    writeln!(
+        output,
+        "live_objects start={live_at_start} end={live_at_end}"
+    )
+    .map_err(|error| format!("benchmark output: {error}"))?;
+    if let Some(final_hash) = final_hash {
+        writeln!(output, "final_hash={final_hash:016x}")
+            .map_err(|error| format!("benchmark output: {error}"))?;
+    }
+    match (frame_error, csv_error) {
+        (Some(frame), Some(csv)) => Err(format!("{frame}; CSV report: {csv}")),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
+    }
 }
 
 /// The calling thread's CPU time, where the platform reports it.
@@ -560,4 +622,163 @@ fn thread_cpu_time() -> Option<Duration> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod partial_report_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use vera20k_core::sim::{runtime::SimResources, world::Simulation};
+
+    struct CsvDirectory(PathBuf);
+
+    impl CsvDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vera20k-sim-bench-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for CsvDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn check_report(fail_at: Option<u64>, completed: u64, csv_failure: bool) {
+        let directory = CsvDirectory::new();
+        let csv = if csv_failure {
+            directory.0.clone()
+        } else {
+            directory.0.join("ticks.csv")
+        };
+        let args = Args {
+            ra2_dir: PathBuf::new(),
+            map: String::new(),
+            scenario: ScenarioKind::March,
+            seed: 0,
+            units: 0,
+            houses: None,
+            computers: None,
+            ticks: None,
+            types: Vec::new(),
+            order_spread: 1,
+            return_at: None,
+            hash_every: 1,
+            frame_hash_every: NonZeroU64::new(1).unwrap(),
+            csv: Some(csv.clone()),
+            serial_paths: true,
+            serial_scans: true,
+        };
+        let mut runtime = SimRuntime {
+            simulation: Simulation::new(),
+            resources: SimResources::empty(),
+        };
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let result = run_benchmark(
+            &mut runtime,
+            &mut Plan::March(Vec::new()),
+            &args,
+            4,
+            1,
+            &mut output,
+            |_, commands| {
+                assert!(commands.is_empty());
+                let tick = calls;
+                calls += 1;
+                if fail_at == Some(tick) {
+                    Err("frame refused".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(calls, fail_at.map_or(4, |tick| tick + 1));
+        if csv_failure {
+            let error = result.unwrap_err();
+            assert!(error.contains(&csv.display().to_string()), "{error}");
+            if let Some(tick) = fail_at {
+                assert!(
+                    error.starts_with(&format!("tick {tick}: frame refused; CSV report: ")),
+                    "{error}"
+                );
+            }
+        } else {
+            assert_eq!(
+                result,
+                fail_at.map_or(Ok(()), |tick| Err(format!("tick {tick}: frame refused")))
+            );
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with(&format!("ticks={completed} "))),
+            "{output}"
+        );
+        if completed == 0 {
+            assert!(
+                output.lines().any(|line| line
+                    == "ticks=0 total_s=0.00 mean_ms=0.00 p50_ms=0.00 p95_ms=0.00 max_ms=0.00"),
+                "{output}"
+            );
+        }
+        let hashes: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("hash tick="))
+            .collect();
+        assert_eq!(hashes.len() as u64, completed, "{output}");
+        for (index, line) in hashes.iter().enumerate() {
+            assert!(
+                line.starts_with(&format!("hash tick={} ", index + 1)),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            output.contains("final_hash="),
+            fail_at.is_none(),
+            "{output}"
+        );
+        if !csv_failure {
+            let csv = std::fs::read_to_string(csv).unwrap();
+            let lines: Vec<_> = csv.lines().collect();
+            assert_eq!(lines[0], "tick,ms,cpu_ms");
+            assert_eq!(lines.len() as u64, completed + 1);
+            for (index, line) in lines[1..].iter().enumerate() {
+                assert!(line.starts_with(&format!("{},", index + 1)), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn first_frame_failure_reports_an_empty_completed_prefix() {
+        check_report(Some(0), 0, false);
+    }
+
+    #[test]
+    fn later_frame_failure_keeps_completed_hashes_csv_and_summary() {
+        check_report(Some(2), 2, false);
+    }
+
+    #[test]
+    fn successful_run_still_reports_every_frame_and_final_hash() {
+        check_report(None, 4, false);
+    }
+
+    #[test]
+    fn csv_failure_keeps_successful_console_report() {
+        check_report(None, 4, true);
+    }
+
+    #[test]
+    fn csv_failure_keeps_partial_console_and_original_frame_error() {
+        check_report(Some(2), 2, true);
+    }
 }
